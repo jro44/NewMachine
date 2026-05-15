@@ -209,3 +209,7 @@ else:
         st.markdown("<br>", unsafe_allow_html=True)
         st.info("### Wytypowany zestaw na podstawie mechaniki i statystyki:")
         st.success(f"## {str_5}  ➕  {str_2}")
+
+       
+if __name__ == "__main__":
+    main()
