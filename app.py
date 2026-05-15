@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import pdfplumber
+import PyPDF2
 import re
 import numpy as np
 from collections import Counter
@@ -15,38 +15,52 @@ N_DRAWS_TO_ANALYZE = 50
 @st.cache_data
 def extract_draw_data(pdf_path, expected_balls):
     """
-    Extracts draw numbers and ball results from the specific multipasko PDF format.
+    Extracts draw numbers and ball results using a high-speed token parser.
+    Ignores complex PDF layout grids and zeroes in on the raw sequence.
     """
-    raw_data = []
+    raw_numbers = []
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
+        with open(pdf_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            for page in reader.pages:
                 text = page.extract_text()
-                if not text:
-                    continue
-                
-                # Regex to find draw numbers (e.g., 0954) followed by potential ball numbers
-                lines = text.split('\n')
-                for line in lines:
-                    # Look for lines that start with a 4-digit draw number
-                    match = re.match(r'^(\d{4})\s+(.*)', line.strip())
-                    if match:
-                        draw_num = int(match.group(1))
-                        # Extract all 2-digit numbers from the rest of the line
-                        balls = [int(b) for b in re.findall(r'\b\d{2}\b', match.group(2))]
+                if text:
+                    # Extract every distinct number cluster from the text stream
+                    raw_numbers.extend(re.findall(r'\d+', text))
+                    
+        data = []
+        current_draw = None
+        current_balls = []
+        
+        for t in raw_numbers:
+            val = int(t)
+            
+            # Identify Draw IDs: Multipasko draw numbers are usually 4 digits (e.g., '0954') 
+            # or are generally values above 50 (max Eurojackpot ball).
+            if len(t) >= 3 or val > 50:
+                current_draw = val
+                current_balls = []
+            else:
+                # Identify Balls: Must be tied to an active draw, valid (>0), and unique
+                if current_draw is not None and val > 0 and val not in current_balls:
+                    current_balls.append(val)
+                    
+                    # Lock the draw once the required number of balls is met
+                    if len(current_balls) == expected_balls:
+                        data.append([current_draw] + sorted(current_balls))
+                        current_draw = None # Reset to prevent accidental overflow from marker digits
                         
-                        if len(balls) == expected_balls:
-                            raw_data.append([draw_num] + balls)
-                            
-        if not raw_data:
+        if not data:
             return pd.DataFrame()
             
-        # Sort by draw number descending (newest first)
-        df = pd.DataFrame(raw_data).sort_values(by=0, ascending=False).reset_index(drop=True)
-        # Rename columns
-        cols = ['Draw'] + [f'Ball_{i+1}' for i in range(expected_balls)]
-        df.columns = cols
+        df = pd.DataFrame(data, columns=['Draw'] + [f'Ball_{i+1}' for i in range(expected_balls)])
+        
+        # Sort by Draw number descending (newest first) and drop dupes
+        df = df.sort_values(by='Draw', ascending=False).reset_index(drop=True)
+        df = df.drop_duplicates(subset=['Draw'])
+        
         return df
+        
     except Exception as e:
         st.error(f"Error reading {pdf_path}: {e}")
         return pd.DataFrame()
@@ -123,14 +137,14 @@ st.markdown("Joint Collaboration: 30-Year Code Veteran & AI Analytical Core")
 st.sidebar.header("Data Ingestion")
 st.sidebar.info("Looking for `5z50.PDF` and `2z12.PDF` in the root directory.")
 
-with st.spinner("Parsing GitHub PDF Directories..."):
+with st.spinner("Executing high-speed token extraction..."):
     df_5z50 = extract_draw_data("5z50.PDF", 5)
     df_2z12 = extract_draw_data("2z12.PDF", 2)
 
 if df_5z50.empty or df_2z12.empty:
-    st.error("Engine halted. Ensure '5z50.PDF' and '2z12.PDF' are in the root directory and structured correctly. Check that the PDF text layer contains 4-digit draw numbers followed by 2-digit ball numbers.")
+    st.error("Engine halted. Ensure '5z50.PDF' and '2z12.PDF' are in the root directory.")
 else:
-    st.success("Data successfully ingested and parsed.")
+    st.success("Data successfully ingested and parsed in milliseconds.")
     
     # Process 5z50
     recent_5z50, movements_5z50 = analyze_machine_movement(df_5z50)
@@ -161,7 +175,7 @@ else:
     # The Silver Bullet
     st.header("🎯 The Silver Bullet")
     st.markdown("""
-    *For the lazy, but mathematically inclined.* This generator bypasses random number generation. It calculates the exact modal delta (most frequent mechanical jump) for each ball position over the last 50 draws, applies it to the very last drawn set, and cross-references missing values with the hottest historical digits.
+    *For the lazy, but mathematically inclined.* This generator bypasses random number generation entirely. It calculates the exact modal delta (most frequent mechanical jump) for each ball position over the last 50 draws, applies it to the very last drawn set, and cross-references missing values with the hottest historical digits.
     """)
     
     if st.button("Generate Set via Machine Movement", type="primary"):
