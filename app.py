@@ -1,105 +1,146 @@
 import streamlit as st
 import pandas as pd
-import pdfplumber
+import PyPDF2
 import re
 import numpy as np
 from collections import Counter
 
-# --- Configuration ---
-st.set_page_config(page_title="Eurojackpot Analysis Engine", layout="wide")
-N_DRAWS_TO_ANALYZE = 50  # Hardcoded for optimal recent mechanical variance
+# ==========================================
+# KONFIGURACJA GŁÓWNA
+# ==========================================
+st.set_page_config(page_title="Silnik Analityczny Eurojackpot", page_icon="⚙️", layout="wide")
 
-# --- Data Extraction Modules ---
+# Ustawienie na sztywno: analizujemy 50 ostatnich losowań
+# Zbyt długa historia wprowadza szum mechaniczny starych bębnów maszyny.
+N_DRAWS_TO_ANALYZE = 50 
+
+# ==========================================
+# MODUŁ EKSTRAKCJI DANYCH (PARSER BUFOROWY)
+# ==========================================
 @st.cache_data
-def extract_draw_data(pdf_path, expected_balls):
+def extract_draw_data(pdf_path, expected_balls, max_ball_val):
     """
-    Extracts draw numbers and ball results from the specific PDF format.
+    Kuloodporny parser tokenów. Ignoruje wizualną siatkę PDF.
+    Opiera się na logice: identyfikatory losowań to 4-cyfrowe liczby (np. '0954').
+    Zbiera kule do bufora i rozdziela je pomiędzy oczekujące losowania.
     """
-    raw_data = []
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if not text:
-                    continue
-                
-                # Regex to find draw numbers (e.g., 0954) followed by potential ball numbers
-                # This is a simplified parser; depending on PDF exact spacing, tweaking might be needed.
-                lines = text.split('\n')
-                for line in lines:
-                    # Look for lines that start with a 4-digit draw number
-                    match = re.match(r'^(\d{4})\s+(.*)', line.strip())
-                    if match:
-                        draw_num = int(match.group(1))
-                        # Extract all 2-digit numbers from the rest of the line
-                        balls = [int(b) for b in re.findall(r'\b\d{2}\b', match.group(2))]
-                        
-                        if len(balls) == expected_balls:
-                            raw_data.append([draw_num] + balls)
+        with open(pdf_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            text = "".join([page.extract_text() for page in reader.pages if page.extract_text()])
+
+        # Ekstrakcja wszystkich ciągów cyfr
+        tokens = re.findall(r'\b\d+\b', text)
+        
+        pending_draws = []
+        collected_balls = []
+        data = []
+        
+        for t in tokens:
+            val = int(t)
+            
+            # Detekcja ID losowania: 4 cyfry, omijamy lata ze stopek (np. 2024, 2026)
+            is_draw_id = len(t) == 4 and (t.startswith('0') or val < 1500)
+            
+            if is_draw_id:
+                pending_draws.append(val)
+            elif 1 <= val <= max_ball_val:
+                # Jeśli mamy oczekujące losowania, zbieramy kule
+                if pending_draws:
+                    collected_balls.append(val)
+                    
+                    # Sprawdzamy, czy bufor kul wypełnił zapotrzebowanie wszystkich oczekujących losowań
+                    if len(collected_balls) == len(pending_draws) * expected_balls:
+                        # Rozdzielamy kule do losowań
+                        for i, draw_id in enumerate(pending_draws):
+                            # Wycinamy odpowiednią partię kul z bufora
+                            start_idx = i * expected_balls
+                            end_idx = start_idx + expected_balls
+                            draw_balls = collected_balls[start_idx:end_idx]
                             
-        # Sort by draw number descending (newest first)
-        df = pd.DataFrame(raw_data).sort_values(by=0, ascending=False).reset_index(drop=True)
-        # Rename columns
-        cols = ['Draw'] + [f'Ball_{i+1}' for i in range(expected_balls)]
-        df.columns = cols
+                            # Sortujemy i dodajemy do danych
+                            unique_balls = sorted(list(set(draw_balls)))
+                            if len(unique_balls) == expected_balls:
+                                data.append([draw_id] + unique_balls)
+                        
+                        # Czyścimy bufory po udanym przypisaniu
+                        pending_draws = []
+                        collected_balls = []
+                        
+        if not data:
+            return pd.DataFrame()
+            
+        # Konwersja na DataFrame
+        cols = ['Losowanie'] + [f'Kula_{i+1}' for i in range(expected_balls)]
+        df = pd.DataFrame(data, columns=cols)
+        
+        # Sortowanie od najnowszego i usunięcie duplikatów
+        df = df.sort_values(by='Losowanie', ascending=False).drop_duplicates(subset=['Losowanie']).reset_index(drop=True)
         return df
+        
+    except FileNotFoundError:
+        st.error(f"Nie znaleziono pliku: {pdf_path}. Upewnij się, że jest w tym samym folderze co skrypt.")
+        return pd.DataFrame()
     except Exception as e:
-        st.error(f"Error reading {pdf_path}: {e}")
+        st.error(f"Błąd krytyczny parsera dla pliku {pdf_path}: {e}")
         return pd.DataFrame()
 
-# --- Analytical Core ---
-def analyze_machine_movement(df):
+# ==========================================
+# SILNIK ANALITYCZNY I OBLICZENIOWY
+# ==========================================
+def analyze_statistics(df):
     """
-    Analyzes the 'machine movement' (difference between consecutive draws) 
-    strictly over the last 50 draws.
+    Oblicza różnice (skoki) pomiędzy kolejnymi losowaniami oraz wyciąga gorące liczby.
+    Używamy wektora różnic (signed difference), aby śledzić kierunek ruchu maszyny.
     """
-    # Isolate the exact historical window
     recent_df = df.head(N_DRAWS_TO_ANALYZE).copy()
     
-    # Calculate differences (deltas) between row i and row i+1
-    # shift(-1) moves the older draw up to compare with the newer draw
-    movements = recent_df.set_index('Draw').diff(periods=-1).dropna().abs()
+    # Różnica z poprzednim chronologicznie losem: nowszy (wiersz i) - starszy (wiersz i+1)
+    # Wartość dodatnia oznacza, że nowa kula była wyższa.
+    movements = recent_df.set_index('Losowanie').diff(periods=-1).dropna().astype(int)
     
-    return recent_df, movements
+    # Obliczanie gorących liczb
+    all_balls = recent_df.iloc[:, 1:].values.flatten()
+    hot_digits = Counter(all_balls).most_common()
+    
+    return recent_df, movements, hot_digits
 
-def get_hot_digits(df, num_balls):
-    """Calculates the most frequent balls in the analyzed dataset."""
-    all_balls = df.iloc[:, 1:].values.flatten()
-    counter = Counter(all_balls)
-    return counter.most_common(num_balls)
+def silver_bullet_generator(recent_df, movements, hot_digits_list, pool_size, expected_balls):
+    """
+    Silver Bullet: Pobiera najczęstszy kierunkowy ruch maszyny (modę) dla każdej kuli,
+    aplikuje go na ostatnie losowanie. W razie kolizji wspiera się gorącymi liczbami.
+    """
+    if recent_df.empty or movements.empty:
+        return []
 
-def silver_bullet_generator(recent_df, movements, pool_size, expected_balls):
-    """
-    The Silver Bullet: Generates a likely set based on the most frequent
-    machine movements applied to the very last draw, prioritizing hot numbers.
-    """
+    # Ostatnie fizyczne losowanie
     last_draw = recent_df.iloc[0, 1:].values
     
-    # Find the most common movement (delta) for each ball position
+    # Wyliczanie najczęstszego ruchu (mody) dla poszczególnych komór
     likely_movements = []
     for col in movements.columns:
-        most_common_delta = int(movements[col].mode()[0])
-        likely_movements.append(most_common_delta)
+        # Pobieramy modę (jeśli jest ich kilka, bierzemy pierwszą)
+        mode_val = int(movements[col].mode().iloc[0])
+        likely_movements.append(mode_val)
     
     generated_set = set()
     
-    # Apply movement to the last draw
-    for i, (ball, delta) in enumerate(zip(last_draw, likely_movements)):
-        # Machine movement can go up or down; we pick the direction 
-        # that keeps it in bounds and hasn't been used yet.
-        option_up = ball + delta
-        option_down = ball - delta
+    # Krok 1: Aplikacja wyliczonej trajektorii maszyny na ostatnie losowanie
+    for ball, delta in zip(last_draw, likely_movements):
+        proposed_ball = ball + delta
         
-        if 1 <= option_up <= pool_size and option_up not in generated_set:
-            generated_set.add(option_up)
-        elif 1 <= option_down <= pool_size and option_down not in generated_set:
-            generated_set.add(option_down)
-            
-    # If the mechanical movement didn't yield enough unique valid balls, 
-    # fill the rest with the hottest numbers from the 50-draw pool.
+        # Walidacja: czy kula mieści się w bębnie i czy nie jest duplikatem
+        if 1 <= proposed_ball <= pool_size and proposed_ball not in generated_set:
+            generated_set.add(proposed_ball)
+        else:
+            # Mechanizm ratunkowy: jeśli ruch wykracza poza bęben, odbijamy wektor w drugą stronę
+            alternative_ball = ball - delta
+            if 1 <= alternative_ball <= pool_size and alternative_ball not in generated_set:
+                generated_set.add(alternative_ball)
+                
+    # Krok 2: Wypełnianie braków (jeśli wektory spowodowały nałożenie się kul na siebie)
     if len(generated_set) < expected_balls:
-        hot_digits = get_hot_digits(recent_df, expected_balls * 2)
-        for num, _ in hot_digits:
+        for num, _ in hot_digits_list:
             if num not in generated_set:
                 generated_set.add(num)
             if len(generated_set) == expected_balls:
@@ -107,53 +148,64 @@ def silver_bullet_generator(recent_df, movements, pool_size, expected_balls):
                 
     return sorted(list(generated_set))
 
-# --- Streamlit UI ---
-st.title("⚙️ Eurojackpot Analytical Engine")
-st.markdown("Joint Collaboration: 30-Year Code Veteran & AI Analytical Core")
+# ==========================================
+# INTERFEJS UŻYTKOWNIKA (UI)
+# ==========================================
+st.title("🎯 Eurojackpot: Zaawansowany Silnik Analityczny")
+st.markdown("Zaprojektowane by **A.K.** | Moduł Analizy Wektorowej i Mechaniki Losowań")
 
-# Load Data
-st.sidebar.header("Data Ingestion")
-with st.spinner("Parsing GitHub PDF Directories..."):
-    df_5z50 = extract_draw_data("5z50.PDF", 5)
-    df_2z12 = extract_draw_data("2z12.PDF", 2)
+# Wczytywanie i Parsowanie Danych
+with st.spinner("Inicjalizacja parsera tokenów... Wczytywanie map Multipasko..."):
+    df_5z50 = extract_draw_data("5z50.PDF", 5, 50)
+    df_2z12 = extract_draw_data("2z12.PDF", 2, 12)
 
 if df_5z50.empty or df_2z12.empty:
-    st.error("Engine halted. Ensure '5z50.PDF' and '2z12.PDF' are in the root directory and structured correctly.")
+    st.error("Brak poprawnych danych. Upewnij się, że pliki 5z50.PDF i 2z12.PDF są w folderze aplikacji.")
 else:
-    st.success("Data successfully ingested and parsed.")
+    # Sukces parsowania - pokazujemy ostatnie zapisane losowanie by udowodnić, że parser działa bezbłędnie
+    last_draw_id = df_5z50['Losowanie'].iloc[0]
+    st.success(f"Analiza zakończona sukcesem. Zdekodowano historię. Ostatnie zmapowane losowanie: **{last_draw_id}**")
     
-    # Process 5z50
-    recent_5z50, movements_5z50 = analyze_machine_movement(df_5z50)
-    hot_5z50 = get_hot_digits(recent_5z50, 10)
-    
-    # Process 2z12
-    recent_2z12, movements_2z12 = analyze_machine_movement(df_2z12)
-    hot_2z12 = get_hot_digits(recent_2z12, 5)
+    # Procesowanie Statystyk
+    recent_5z50, movements_5z50, hot_5z50 = analyze_statistics(df_5z50)
+    recent_2z12, movements_2z12, hot_2z12 = analyze_statistics(df_2z12)
 
+    # --- Wizualizacja Danych ---
+    st.divider()
     col1, col2 = st.columns(2)
     
     with col1:
-        st.subheader("📊 5/50 Machine Movement Analysis")
-        st.write(f"Tracking positional momentum across the last {N_DRAWS_TO_ANALYZE} draws.")
-        st.dataframe(movements_5z50.style.background_gradient(cmap='Greens'))
-        st.write("**Top Hot Digits (Last 50 Draws):**", [n for n, c in hot_5z50])
+        st.subheader("Bęben 1: Statystyki 5/50")
+        st.markdown(f"*Analiza odchyleń z ostatnich {N_DRAWS_TO_ANALYZE} losowań*")
+        st.dataframe(movements_5z50.style.background_gradient(cmap='RdYlGn', axis=0), height=300, use_container_width=True)
+        st.markdown("**Top 10 Gorących Liczb:**")
+        st.code(" | ".join([f"{n} ({c}x)" for n, c in hot_5z50[:10]]))
 
     with col2:
-        st.subheader("📊 2/12 Machine Movement Analysis")
-        st.write(f"Tracking positional momentum across the last {N_DRAWS_TO_ANALYZE} draws.")
-        st.dataframe(movements_2z12.style.background_gradient(cmap='Blues'))
-        st.write("**Top Hot Digits (Last 50 Draws):**", [n for n, c in hot_2z12])
+        st.subheader("Bęben 2: Statystyki 2/12")
+        st.markdown(f"*Analiza odchyleń z ostatnich {N_DRAWS_TO_ANALYZE} losowań*")
+        st.dataframe(movements_2z12.style.background_gradient(cmap='RdYlGn', axis=0), height=300, use_container_width=True)
+        st.markdown("**Top 5 Gorących Liczb:**")
+        st.code(" | ".join([f"{n} ({c}x)" for n, c in hot_2z12[:5]]))
 
     st.divider()
 
-    # The Silver Bullet
-    st.header("🎯 The Silver Bullet")
+    # --- Generacja Srebrnej Kuli ---
+    st.header("⚡ Funkcja 'Silver Bullet'")
     st.markdown("""
-    *For the lazy, but mathematically inclined.* This generator does not use `random`. It calculates the exact modal delta (most frequent mechanical jump) for each ball position over the last 50 draws, applies it to the very last drawn set, and cross-references missing values with the hottest historical digits.
+    To nie jest ślepy generator `random`. Algorytm wylicza **modę skoku** (najczęściej występującą matematyczną różnicę pomiędzy poprzednim a aktualnym losem) oddzielnie dla każdej z 7 wylosowanych pozycji. 
+    Następnie nakłada te wektory ruchu na absolutnie ostatnie losowanie. Ewentualne braki uzupełnia najgorętszymi kulami z puli.
     """)
     
-    if st.button("Generate Set via Machine Movement", type="primary"):
-        silver_5 = silver_bullet_generator(recent_5z50, movements_5z50, 50, 5)
-        silver_2 = silver_bullet_generator(recent_2z12, movements_2z12, 12, 2)
+    # Renderowanie wyjścia generatora
+    if st.button("🚀 Uruchom Analizę i Generuj Zestaw", type="primary", use_container_width=True):
+        silver_5 = silver_bullet_generator(recent_5z50, movements_5z50, hot_5z50, 50, 5)
+        silver_2 = silver_bullet_generator(recent_2z12, movements_2z12, hot_2z12, 12, 2)
         
-        st.success(f"### Proposed Set: {silver_5} + {silver_2}")
+        # Formatowanie do eleganckiego widoku
+        str_5 = " 🟢 ".join([f"{x:02d}" for x in silver_5])
+        str_2 = " 🟡 ".join([f"{x:02d}" for x in silver_2])
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.info("### Wytypowany zestaw na podstawie mechaniki i statystyki:")
+        st.success(f"## {str_5}  ➕  {str_2}")
